@@ -227,7 +227,8 @@ class NovelViewRenderer:
         """
 
         # If no cam_index is specified, assume the pose is for the origin camera.
-        if not cam_index:
+        # Only None means unspecified: index 0 (CamA) is a valid camera.
+        if cam_index is None:
             cam_index = self.get_origin_camera_index()
 
         #If is_6dof is not specified, pose is assumed to be a 4x4 view matrix
@@ -389,6 +390,11 @@ class VilotaDevice:
         self.loaded = False
         self.loader = None
         self.offset_from_origin =[1.0, 2.0, 3.0]  # Default offset from origin camera
+        # Scene scale [m per scene unit]. Extrinsic translations are metric
+        # (cm/100 above); composing them with scene-space views must happen
+        # in scene units when the scene is not 1 unit = 1 m. Set by the
+        # SCENE_ALIGNMENT path in vio_trajectory; 1.0 keeps old behaviour.
+        self.metres_per_unit = 1.0
 
     @classmethod
     def load_from_path(cls, path: str) -> 'VilotaDevice':
@@ -428,7 +434,9 @@ class VilotaDevice:
         elif self.name.startswith("DP180IP"):
             
             return VILOTA_CAM_MAP["DP180IP"]["cam_names"][index]
-        elif self.product_name_name.startswith("VKL-"):
+        elif self.product_name.startswith("VK180"):
+            return VILOTA_CAM_MAP["DP180IP"]["cam_names"][index]
+        elif self.product_name.startswith("VKL-"):
             return VILOTA_CAM_MAP["VKL"]["cam_names"][index]
         else:
             raise ValueError(f"Unknown camera index {index} for device {self.name}.")
@@ -482,8 +490,9 @@ class VilotaDevice:
             F = np.diag([1, -1, -1, 1])
             world_to_cam0 = F@ new_view_matrix @F
             cam0_to_world = np.linalg.inv(world_to_cam0)
-            cam_i_to_cam0 = self.extrinsics[index]
-            cami_to_world = cam0_to_world @ np.array(cam_i_to_cam0)
+            cam_i_to_cam0 = np.array(self.extrinsics[index], dtype=float).copy()
+            cam_i_to_cam0[:3, 3] /= self.metres_per_unit   # metric -> scene units
+            cami_to_world = cam0_to_world @ cam_i_to_cam0
             
             world_to_cami = np.linalg.inv(cami_to_world)  # Invert to get the view matrix
             new_view_mat = F @ world_to_cami @ F
@@ -506,8 +515,13 @@ class VilotaDevice:
         Returns:
             world_to_camd (np.ndarray): View matrix to origin camera
         """
-        cami_to_cam0 = self.extrinsics[cam_index]
-        world_to_camd = cami_to_cam0 @ world_to_cami
+        # world_to_cami arrives in polyscope/OpenGL axes but the calibration
+        # extrinsic is in OpenCV axes: convert, compose, convert back so the
+        # returned origin view is in the same axes as the input.
+        F = np.diag([1.0, -1.0, -1.0, 1.0])
+        cami_to_cam0 = np.array(self.extrinsics[cam_index], dtype=float).copy()
+        cami_to_cam0[:3, 3] /= self.metres_per_unit   # metric -> scene units
+        world_to_camd = F @ (cami_to_cam0 @ (F @ world_to_cami @ F)) @ F
 
         return world_to_camd
 
@@ -653,9 +667,17 @@ class Loader:
         extrinsic_matrix = build_extrinsic_mat_from_rotation_translation(rotation_matrix, translation_vector)
         print(f"Extrinsic Matrix {cam_rig_index}:\n{extrinsic_matrix}")
 
+        # The calibration extrinsic is cam_i->origin in OpenCV axes, but the
+        # camera stores world->cam_i in polyscope/OpenGL axes. Convert so the
+        # loaded pose equals what move_rig_to_view produces for an identity
+        # origin pose; storing extrinsic_matrix raw left the rig flipped and
+        # inverted until the first rig move.
+        F = np.diag([1.0, -1.0, -1.0, 1.0])
+        initial_view_matrix = F @ np.linalg.inv(extrinsic_matrix) @ F
+
         # Convert to Distortion Camera object
         distortion_camera = Camera.from_args(
-            view_matrix = torch.tensor(extrinsic_matrix, dtype=torch.float64, device=device),
+            view_matrix = torch.tensor(initial_view_matrix, dtype=torch.float64, device=device),
             focal_x = f_x,
             focal_y = f_y,
             x0 = c_x,
