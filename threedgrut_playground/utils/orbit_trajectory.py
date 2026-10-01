@@ -23,12 +23,38 @@ import polyscope as ps
 
 # Camera indices on the rig and which aim grid each uses.
 # ORBIT_CAMS: restrict the orbit to some cameras, e.g. ORBIT_CAMS=3 for
-# CamD only. Unset = all four. The render still writes all four topics; this
-# only chooses which cameras get poses aimed for them.
+# CamD only. Unset = every camera the device has. The render still writes
+# every camera's topic; this only chooses which cameras get poses aimed for
+# them. The DP180 socket split these constants used to hard-code (KB4 at
+# 0, 1, 2 and DS at 3) is now derived from the loaded device by
+# rig_plan_cams; the constants remain as the documented DP180 defaults.
 _only = os.environ.get("ORBIT_CAMS")
 _sel = [int(x) for x in _only.split(",")] if _only else [0, 1, 2, 3]
 KB4_CAMS = [c for c in (0, 1, 2) if c in _sel]
 DS_CAMS = [c for c in (3,) if c in _sel]
+
+
+def rig_plan_cams(nvr):
+    """KB4 and DS camera sockets of the LOADED rig, ORBIT_CAMS-filtered.
+
+    The split follows the same rule the render engine uses to pick the
+    projection (distortionCoeff[5] == 0 -> KB4 fit, else Double Sphere), so
+    a rig whose sockets differ from DP180's 0-3 (NV180: 1, 2, 3 with the DS
+    camera at socket 1) gets a correct plan. On DP180IP files this
+    reproduces the old constants: KB4 at 0, 1, 2 and DS at 3.
+    """
+    dists = nvr.get_cam_distortions()
+    sockets = sorted(nvr.get_all_cameras())
+    only = os.environ.get("ORBIT_CAMS")
+    sel = [int(x) for x in only.split(",")] if only else sockets
+
+    def is_ds(s):
+        d = dists.get(s)
+        return d is not None and len(d) > 5 and float(d[5]) != 0.0
+
+    kb4 = [s for s in sockets if s in sel and not is_ds(s)]
+    ds = [s for s in sockets if s in sel and is_ds(s)]
+    return kb4, ds
 
 # Viewpoints, shared by all cameras.
 ELEVATIONS = [-20.0, 20.0]
@@ -359,8 +385,9 @@ def build_orbit_trajectory(gui, cam_index=None, name_hint="Quad", flip=False,
               f"{max(abs(a) for a in AIM_DS[1]) * aim_scale:.0f} deg, "
               f"KB4 yaw/pitch max {max(abs(a) for a in AIM_KB4[0]) * aim_scale_kb4:.0f}/"
               f"{max(abs(a) for a in AIM_KB4[1]) * aim_scale_kb4:.0f} deg")
-    plan = [(c, aim_angles(*scaled(AIM_KB4, aim_scale_kb4))) for c in KB4_CAMS]
-    plan += [(c, aim_angles(*scaled(AIM_DS, aim_scale))) for c in DS_CAMS]
+    kb4_cams, ds_cams = rig_plan_cams(nvr)
+    plan = [(c, aim_angles(*scaled(AIM_KB4, aim_scale_kb4))) for c in kb4_cams]
+    plan += [(c, aim_angles(*scaled(AIM_DS, aim_scale))) for c in ds_cams]
 
     poses = None
     per_cam = {}
