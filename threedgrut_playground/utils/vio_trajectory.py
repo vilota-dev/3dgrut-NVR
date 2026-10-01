@@ -45,10 +45,19 @@ keep working; ARM_REACH is ignored here because clamping breaks C2):
   VIO_CHECK_CAMS       comma-separated sockets VIO tracks (e.g. 1,2 for
                        the NV180's nv180_minimal camb+camc pair). They
                        replace the default coverage-check set (every KB4
-                       camera except socket 0), and the TRACKABLE_PX
-                       design formula then uses the largest focal among
-                       them instead of the whole rig's. Unset: the
+                       camera except socket 0), the TRACKABLE_PX design
+                       formula uses the largest focal among them, the
+                       analytic path frames the boards in the tracked
+                       camera closest to the reference axis
+                       (select_framing - a narrow reference no longer
+                       pushes the bands out of the room), and two
+                       scene-plausibility checks arm: the far band must
+                       stay within 5x the board-fit distance, and the
+                       peak speed under VIO_MAX_SPEED. Unset: the
                        historical behaviour, byte for byte.
+  VIO_MAX_SPEED        peak-speed ceiling [m/s] for the plausibility
+                       check above, default 3.0. Checked only when
+                       VIO_CHECK_CAMS is set.
   VIO_TRAJ_NPZ         ground-truth output, default mcap_outputs/vio_truth.npz
   VIO_WAYPOINTS        waypoint file (same formats as --waypoints below).
                        build_vio_trajectory then renders the C2 spline
@@ -184,6 +193,36 @@ def load_rig(calib_path):
     return cams, ref
 
 
+def select_framing(rig, ref_sock):
+    """Socket of the tracked camera the analytic path frames the boards in.
+
+    VIO_CHECK_CAMS declares the sockets VIO tracks; the path then designs
+    its distance bands and aim budget around a TRACKED camera instead of
+    the reference. A narrow reference (NV180 camd, 18.5 deg half field)
+    would otherwise back the rig off until the boards fit its cone - 22 m
+    on the NV180, outside any room. Among the tracked sockets the one
+    whose optical axis lies closest to the reference axis wins (NV180:
+    camc at 20.3 deg over camb at 75.5 deg): it keeps the rig attitude
+    nearest the historical reference-centred conventions while its wide
+    field restores DP180-like distances. None when the env is unset or
+    the reference itself wins - the historical reference-framed design,
+    bit for bit."""
+    env = os.environ.get("VIO_CHECK_CAMS")
+    if not env:
+        return None
+    socks = [int(t) for t in env.replace(",", " ").split()]
+    bad = [s for s in socks if s not in rig]
+    if bad:
+        raise ValueError(f"VIO_CHECK_CAMS={env}: socket(s) {bad} not in "
+                         f"the rig (has {sorted(rig)})")
+
+    def off_axis(s):
+        z = rig[s]["T_camd_cam"][:3, :3] @ np.array([0.0, 0.0, 1.0])
+        return math.acos(min(1.0, max(-1.0, float(z[2]))))
+    best = min(socks, key=off_axis)
+    return None if best == ref_sock else best
+
+
 def usable_half_angle(cam, axis, pad_px=EDGE_PAD_PX):
     """Max angle off the optical axis (deg) that stays pad_px inside the
     image edge, solved by bisection on the camera's own projection model."""
@@ -222,6 +261,10 @@ class VioConfig:
             self.motion_s = T_DIST
         self.fps = float(env("VIO_FPS", 20.0))
         self.trackable_px = float(env("TRACKABLE_PX", 50.0))
+        # Scene-plausibility speed ceiling, checked only when
+        # VIO_CHECK_CAMS declares the tracked cameras (the historical
+        # default runs stay byte-identical).
+        self.max_speed = float(env("VIO_MAX_SPEED", 3.0))
         # STRESS multiplies the post-ramp phase clock (see pose_at): x1.0
         # is exact (a float times 1.0 is itself), so the default path is
         # bit-identical to the pre-STRESS generator.
@@ -238,9 +281,16 @@ class VioConfig:
 
 
 class PathGeometry:
-    """Board cloud in the (right, up, fwd) frame + distance bands + budgets."""
+    """Board cloud in the (right, up, fwd) frame + distance bands + budgets.
 
-    def __init__(self, cloud, center, normal, ref_cam):
+    frame_cam/frame_sock (from select_framing): design the aim budget and
+    the distance bands around that TRACKED camera instead of the reference;
+    pose_at then aims it at the boards and re-expresses the pose in the
+    reference camera via R_align (the fixed mounting rotation). None keeps
+    the historical reference-framed design exactly."""
+
+    def __init__(self, cloud, center, normal, ref_cam, frame_cam=None,
+                 frame_sock=None):
         self.cloud = np.asarray(cloud, float)
         self.center = np.asarray(center, float)
         self.fwd = np.asarray(normal, float) / np.linalg.norm(normal)
@@ -253,14 +303,20 @@ class PathGeometry:
         d_fit = self.hz + max(
             self.hx / math.tan(math.radians(FIT_HALF_FOV_X_DEG)),
             self.hy / math.tan(math.radians(FIT_HALF_FOV_Y_DEG)))
+        self.d_fit = d_fit
+        self.frame_sock = frame_sock
+        self.R_align = (None if frame_cam is None
+                        else frame_cam["T_camd_cam"][:3, :3].T)
+        design_cam = ref_cam if frame_cam is None else frame_cam
 
-        # Usable half fields of the reference camera, minus a margin and
-        # minus what the roll oscillation rotates in from the OTHER axis at
-        # full corner reach (roll couples the axes: sin(roll) x the other
+        # Usable half fields of the design camera (the framing camera when
+        # one is selected, else the reference), minus a margin and minus
+        # what the roll oscillation rotates in from the OTHER axis at full
+        # corner reach (roll couples the axes: sin(roll) x the other
         # axis's extreme angle lands here). Boards then sweep near the
         # edges yet stay inside.
-        ux = usable_half_angle(ref_cam, 0)
-        uy = usable_half_angle(ref_cam, 1)
+        ux = usable_half_angle(design_cam, 0)
+        uy = usable_half_angle(design_cam, 1)
         cross = math.sin(math.radians(ROLL_AMP_DEG))
         self.bud_x = ux - AIM_MARGIN_X_DEG - cross * uy
         self.bud_y = uy - AIM_MARGIN_Y_DEG - cross * ux
@@ -341,7 +397,17 @@ def pose_at(t, cfg, geom):
     aim = (geom.center + cam_r * (dist * math.tan(ax))
            + cam_u * (dist * math.tan(ay)))
     roll = math.radians(ROLL_AMP_DEG) * math.sin(w * tau / T_ROLL)
-    return eye, _look_at_gl(eye, aim, roll)
+    R_gl = _look_at_gl(eye, aim, roll)
+    if geom.R_align is not None:
+        # The look-at above aims the FRAMING camera at the boards.
+        # Re-express the pose as the reference camera's GL view through
+        # the fixed mounting rotation, so every consumer (sample_path,
+        # the GUI trajectory, the truth npz) still deals in
+        # reference-camera poses. The few-cm lever between the two
+        # optical centres is absorbed by the aim margins and verified by
+        # the strict framing-containment check.
+        R_gl = F3 @ geom.R_align.T @ F3 @ R_gl
+    return eye, R_gl
 
 
 F3 = np.diag([1.0, -1.0, -1.0])  # OpenGL camera axes <-> optical (OpenCV)
@@ -475,22 +541,26 @@ def _dirs_in_image(dirs, cam):
                & (px[:, 1] >= 0) & (px[:, 1] < h)), px
 
 
-def _reachable_quadrants(cam, ref_cam):
+def _reachable_quadrants(cam, container_cam):
     """(4,) bool: the quadrants of cam that board corners can occupy AT ALL
-    while the strict 'boards inside reference cam' invariant holds - the
-    reference camera's image cone, rotated into cam and projected with
-    cam's own model. Deterministic Fibonacci-sphere sweep; the few-cm
-    translations between the rig cameras are negligible against board
-    distances in metres at quadrant granularity."""
+    while the strict boards-inside-the-container invariant holds (the
+    container is the framing camera when one is selected, else the
+    reference) - the container's image cone, rotated into cam and
+    projected with cam's own model. Deterministic Fibonacci-sphere sweep;
+    the few-cm translations between the rig cameras are negligible against
+    board distances in metres at quadrant granularity. Directions are
+    sampled in the container's own optical frame."""
     n = 20000
     i = np.arange(n)
     phi = math.pi * (3.0 - math.sqrt(5.0)) * i
     z = 1.0 - 2.0 * (i + 0.5) / n
     r = np.sqrt(np.maximum(1.0 - z * z, 0.0))
     dirs = np.stack([r * np.cos(phi), r * np.sin(phi), z], axis=1)
-    inside, _ = _dirs_in_image(dirs, ref_cam)
-    T_cam_ref = np.linalg.inv(cam["T_camd_cam"])
-    inside, px = _dirs_in_image(dirs[inside] @ T_cam_ref[:3, :3].T, cam)
+    inside, _ = _dirs_in_image(dirs, container_cam)
+    # container optical frame -> cam optical frame (rotation only)
+    R_rel = (cam["T_camd_cam"][:3, :3].T
+             @ container_cam["T_camd_cam"][:3, :3])
+    inside, px = _dirs_in_image(dirs[inside] @ R_rel.T, cam)
     u, v = px[inside, 0], px[inside, 1]
     cx, cy = cam["params"]["cx"], cam["params"]["cy"]
     return np.array([bool(((u < cx) & (v < cy)).any()),
@@ -513,6 +583,7 @@ def run_checks(cfg, geom, rig, ref_sock, times, eyes, R_wc, check_cams=None):
     dt = 1.0 / cfg.fps
     pts_w = geom.cloud
     track_cams = list(rig)
+    declared = False
     if check_cams is None:
         env_cams = os.environ.get("VIO_CHECK_CAMS")
         if env_cams:
@@ -523,9 +594,13 @@ def run_checks(cfg, geom, rig, ref_sock, times, eyes, R_wc, check_cams=None):
                     f"VIO_CHECK_CAMS={env_cams}: socket(s) {bad} not in "
                     f"the rig (has {sorted(rig)})")
             track_cams = check_cams
+            declared = True
         else:
             check_cams = [s for s, c in rig.items()
                           if c["model"] == "kb4" and s != 0]
+    frame_sock = getattr(geom, "frame_sock", None)
+    if frame_sock is None:
+        frame_sock = ref_sock
 
     dists = np.linalg.norm(eyes - geom.center, axis=1)
     band_w = geom.d_far - geom.d_near
@@ -535,6 +610,21 @@ def run_checks(cfg, geom, rig, ref_sock, times, eyes, R_wc, check_cams=None):
                    bool(near_f.any() and far_f.any()),
                    "distance bands not both visited", True))
 
+    # Scene plausibility (only when the tracked cameras are declared, so
+    # the historical default output stays byte-identical): the bands must
+    # stay near the board-fit distance - a design that backs off far
+    # beyond it (a narrow camera framing the boards) has left the scene
+    # the boards stand in.
+    if declared:
+        checks.append((
+            "bands within the fit cone",
+            bool(geom.d_far <= 5.0 * geom.d_fit),
+            f"far band {geom.d_far:.2f} m is "
+            f"{geom.d_far / geom.d_fit:.1f}x the board-fit distance "
+            f"{geom.d_fit:.2f} m (max 5.0x) - the design backed out of "
+            f"the scene; frame the boards in a wide tracked camera",
+            True))
+
     # per-camera projections over the whole path
     cams = {s: rig[s] for s in set(list(rig)) }
     cov = {}
@@ -543,6 +633,12 @@ def run_checks(cfg, geom, rig, ref_sock, times, eyes, R_wc, check_cams=None):
         w, h = cam["width"], cam["height"]
         cx, cy = cam["params"]["cx"], cam["params"]["cy"]
         T_cam_camd = np.linalg.inv(cam["T_camd_cam"])
+        # Corners past a KB4 fit's fold angle project inside the image
+        # bounds but render NOTHING (fisheye.py truncates its LUT there),
+        # so they count neither as coverage nor as flow. pi for monotonic
+        # fits and DS keeps the historical predicate bit for bit.
+        fold = (_kb4_fold_theta(cam["params"]) if cam["model"] == "kb4"
+                else math.pi)
         quad = np.zeros(4, int)
         hist = np.zeros((4, 6), int)
         umin, umax, vmin, vmax = w, 0.0, h, 0.0
@@ -556,6 +652,10 @@ def run_checks(cfg, geom, rig, ref_sock, times, eyes, R_wc, check_cams=None):
             pts_cam = (pts_cam @ T_cam_camd[:3, :3].T) + T_cam_camd[:3, 3]
             px, ok = _project(pts_cam, cam)
             ok = ok & (pts_cam[:, 2] > 0)
+            if fold < math.pi:
+                nrm = np.maximum(np.linalg.norm(pts_cam, axis=1), 1e-12)
+                theta = np.arccos(np.clip(pts_cam[:, 2] / nrm, -1.0, 1.0))
+                ok = ok & (theta < fold)
             inside = ok & (px[:, 0] >= 0) & (px[:, 0] < w) \
                         & (px[:, 1] >= 0) & (px[:, 1] < h)
             inside_all[i] = inside.all()
@@ -579,33 +679,45 @@ def run_checks(cfg, geom, rig, ref_sock, times, eyes, R_wc, check_cams=None):
                 if both.any():
                     step = np.linalg.norm(px[both] - prev_px[both], axis=1).max()
                     max_step = max(max_step, float(step))
-                    steps_frame[i] = max(steps_frame[i], float(step))
+                    # the per-frame flow series follows the trackability
+                    # scope: only the declared tracked cameras feed it
+                    if not declared or s in track_cams:
+                        steps_frame[i] = max(steps_frame[i], float(step))
             prev_px, prev_ok = px, inside
         cov[s] = dict(quad=quad, hist=hist, span_u=(umin, umax),
                       span_v=(vmin, vmax), near=in_near, far=in_far,
                       max_step_px=max_step, always_inside=bool(inside_all.all()),
                       inside_frames=inside_all)
 
-    # boards stay in view of the reference camera, every frame
-    checks.append(("boards inside reference cam",
-                   bool(cov[ref_sock]["always_inside"]),
-                   "board corners leave the reference camera's image", True))
+    # boards stay in view of the framing camera (the reference, unless a
+    # tracked camera frames the path - see select_framing), every frame
+    if frame_sock == ref_sock:
+        checks.append(("boards inside reference cam",
+                       bool(cov[ref_sock]["always_inside"]),
+                       "board corners leave the reference camera's image",
+                       True))
+    else:
+        checks.append((f"boards inside framing cam{'abcd'[frame_sock]}",
+                       bool(cov[frame_sock]["always_inside"]),
+                       "board corners leave the framing camera's image",
+                       True))
 
     for s in check_cams:
         c = cov[s]
         # Only demand quadrants the rig geometry can reach: a camera
-        # mounted off the reference axis (NV180 camc, 20 deg pitch vs the
+        # mounted off the framing axis (NV180 camc, 20 deg pitch vs the
         # 18.5 deg half-field narrow reference) can never image boards in
-        # quadrants the reference cone does not map into.
-        reach = _reachable_quadrants(rig[s], rig[ref_sock])
+        # quadrants the framing camera's cone does not map into.
+        reach = _reachable_quadrants(rig[s], rig[frame_sock])
         if reach.all():
             msg = (f"socket {s}: quadrant counts {c['quad'].tolist()} - "
                    f"not all four")
         else:
+            src = "reference" if frame_sock == ref_sock else "framing"
             msg = (f"socket {s}: quadrant counts {c['quad'].tolist()} - "
                    f"reachable quadrants {np.flatnonzero(reach).tolist()} "
                    f"not all covered (the rest are unreachable from the "
-                   f"reference camera's cone)")
+                   f"{src} camera's cone)")
         checks.append((f"quadrant coverage cam{'abcd'[s]}",
                        bool((c["quad"][reach] > 0).all()), msg, True))
         checks.append((f"both bands seen by cam{'abcd'[s]}",
@@ -626,6 +738,18 @@ def run_checks(cfg, geom, rig, ref_sock, times, eyes, R_wc, check_cams=None):
         w=float(np.linalg.norm(wvec, axis=1).max()),
         alpha=float(np.linalg.norm(alpha, axis=1).max()))
 
+    # Scene plausibility, speed side (tracked-cams runs only): the rig is
+    # carried through a room, so its speed must stay in a handheld/robot
+    # range whatever distances the design chose.
+    if declared:
+        checks.append((
+            "peak speed plausible",
+            bool(peak["v"] <= cfg.max_speed),
+            f"peak speed {peak['v']:.2f} m/s exceeds VIO_MAX_SPEED "
+            f"{cfg.max_speed:g} m/s - implausible for a scene-bound rig; "
+            f"the distance bands have left the scene's scale",
+            True))
+
     # trackability: focal x angular step + translation flow at the nearest
     # board point, per frame (the design formula), plus the measured corner
     # step from the projections above. Both must clear TRACKABLE_PX.
@@ -634,13 +758,17 @@ def run_checks(cfg, geom, rig, ref_sock, times, eyes, R_wc, check_cams=None):
     # NV180's untracked camd, fx 4263, would otherwise bound a camera VIO
     # never sees).
     f_max = max(cams[s]["params"]["fx"] for s in track_cams)
+    measured_cams = track_cams if declared else list(cov)
     d_min = np.array([np.linalg.norm(pts_w - eyes[i], axis=1).min()
                       for i in range(n)])
     dth = np.linalg.norm(wvec, axis=1) * dt
     dp = np.linalg.norm(np.diff(eyes, axis=0), axis=1)
     px_bound = f_max * dth + f_max * dp / d_min[:-1]
     peak["px_formula"] = float(px_bound.max())
-    peak["px_measured"] = max(c["max_step_px"] for c in cov.values())
+    # measured flow, like the formula, is a trackability statement: when
+    # the tracked cameras are declared it ranges over them (the untracked
+    # NV180 camd, fx 4263, carries fast flow VIO never sees)
+    peak["px_measured"] = max(cov[s]["max_step_px"] for s in measured_cams)
     checks.append(("px formula <= ceiling",
                    peak["px_formula"] <= cfg.trackable_px,
                    f"per-frame displacement bound {peak['px_formula']:.1f} px exceeds "
@@ -784,8 +912,16 @@ def build_vio_trajectory(gui, name_hint="Quad", flip=False):
     nvr = gui.novel_view_renderer
     calib_path = nvr.calibration_fullpath
     rig, ref_sock = load_rig(calib_path)
-    geom = PathGeometry(cloud, center, normal, rig[ref_sock])
+    frame_sock = select_framing(rig, ref_sock)
+    geom = PathGeometry(cloud, center, normal, rig[ref_sock],
+                        frame_cam=(None if frame_sock is None
+                                   else rig[frame_sock]),
+                        frame_sock=frame_sock)
     print(f"[vio] target {label}, calib {calib_path}")
+    if frame_sock is not None:
+        print(f"[vio] framing cam{'abcd'[frame_sock]} (tracked): distance "
+              f"bands and aim budget designed around it, not the "
+              f"reference")
     print(f"[vio] bands {geom.d_near:.2f}..{geom.d_far:.2f} m, aim budget "
           f"({geom.bud_x:.0f}, {geom.bud_y:.0f}) deg")
 
@@ -1166,9 +1302,13 @@ def main(argv=None):
         print(f"[vio] alignment {cfg.alignment_path}: --cloud converted "
               f"from scene units at {align.scale:.4f} m/unit")
     rig, ref_sock = load_rig(args.calib)
+    frame_sock = select_framing(rig, ref_sock)
     center = 0.5 * (cloud.min(0) + cloud.max(0))
     geom = PathGeometry(cloud, center, np.array([0.0, 0.0, 1.0]),
-                        rig[ref_sock])
+                        rig[ref_sock],
+                        frame_cam=(None if frame_sock is None
+                                   else rig[frame_sock]),
+                        frame_sock=frame_sock)
 
     seed = None
     if args.waypoints:
@@ -1194,6 +1334,9 @@ def main(argv=None):
     print(f"calib {args.calib} (ref cam{'abcd'[ref_sock]}, "
           f"{rig[ref_sock]['model']}), {len(times)} frames @ {cfg.fps:g} "
           f"fps, {cfg.lead_s:g} s lead + {cfg.motion_s:g} s motion")
+    if frame_sock is not None:
+        print(f"framing cam{'abcd'[frame_sock]} (tracked): bands and aim "
+              f"budget designed around it, not the reference")
     print(f"bands {geom.d_near:.2f}..{geom.d_far:.2f} m, aim budget "
           f"({geom.bud_x:.0f}, {geom.bud_y:.0f}) deg")
     width = max(len(c[0]) for c in checks)
