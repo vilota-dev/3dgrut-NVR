@@ -149,9 +149,14 @@ def run_nv180():
       6. The default checks pass camc on its reachable quadrants (the old
          all-four rule failed on [n, n, 0, 0]) and still fail the px
          formula on the whole-rig focal (untracked camd, fx 4263).
-      7. VIO_CHECK_CAMS=1,2 (the nv180_minimal tracked pair) scopes the
-         coverage checks and the trackability focal: every strict check
-         passes."""
+      7. VIO_CHECK_CAMS=1,2 (the nv180_minimal tracked pair) frames the
+         path in camc (select_framing), bringing the bands into the room
+         (DP180's range, not 22..35 m): every strict check passes,
+         including the armed scene-plausibility checks.
+      8. Regression: with the tracked cameras declared, the old
+         reference-framed far path fails 'bands within the fit cone' AND
+         'peak speed plausible' - a path that leaves the scene can no
+         longer pass."""
     rig, ref = vt.load_rig(NV_CALIB)
     assert ref == 3 and rig[ref]["model"] == "kb4"
 
@@ -191,21 +196,50 @@ def run_nv180():
 
     os.environ["VIO_CHECK_CAMS"] = "1,2"
     try:
-        metrics, checks = vt.run_checks(cfg, geom, rig, ref, times, eyes,
-                                        R_wc)
+        fs = vt.select_framing(rig, ref)
+        assert fs == 2, f"framing pick {fs}: camc (20.3 deg off the " \
+                        f"reference) must beat camb (75.5 deg)"
+        geom_f = vt.PathGeometry(cloud, center, np.array([0.0, 0.0, 1.0]),
+                                 rig[ref], frame_cam=rig[fs], frame_sock=fs)
+        assert geom_f.d_far <= 5.0 * geom_f.d_fit, \
+            (geom_f.d_far, geom_f.d_fit)
+        assert geom_f.d_far < 4.5, \
+            f"far band {geom_f.d_far:.2f} m - outside a room again"
+        times_f, eyes_f, R_f = vt.sample_path(cfg, geom_f)
+        metrics, checks = vt.run_checks(cfg, geom_f, rig, ref, times_f,
+                                        eyes_f, R_f)
+        names = [name for name, *_ in checks]
+        assert metrics["check_cams"] == [1, 2]
+        assert "quadrant coverage camb" in names
+        assert "quadrant coverage camd" not in names
+        assert "boards inside framing camc" in names
+        assert "boards inside reference cam" not in names
+        assert "bands within the fit cone" in names
+        assert "peak speed plausible" in names
+        failed = [name for name, ok, _msg, strict in checks
+                  if strict and not ok]
+        assert failed == [], f"strict failures with the framed path: {failed}"
+        assert metrics["peak"]["v"] <= cfg.max_speed
+        assert metrics["peak"]["px_formula"] <= cfg.trackable_px
+        assert metrics["peak"]["px_measured"] <= cfg.trackable_px
+        print(f"PASS  nv180: framed in camc - bands "
+              f"{geom_f.d_near:.2f}..{geom_f.d_far:.2f} m, budget "
+              f"({geom_f.bud_x:.0f}, {geom_f.bud_y:.0f}) deg, peak speed "
+              f"{metrics['peak']['v']:.2f} m/s, all strict checks pass")
+
+        # 8. the old reference-framed far path cannot pass armed checks
+        metrics_b, checks_b = vt.run_checks(cfg, geom, rig, ref, times,
+                                            eyes, R_wc)
+        failed_b = [name for name, ok, _msg, strict in checks_b
+                    if strict and not ok]
+        assert "bands within the fit cone" in failed_b, failed_b
+        assert "peak speed plausible" in failed_b, failed_b
+        print(f"PASS  nv180: the reference-framed far path "
+              f"({geom.d_near:.2f}..{geom.d_far:.2f} m, "
+              f"{metrics_b['peak']['v']:.2f} m/s) fails the "
+              f"scene-plausibility checks: {failed_b}")
     finally:
         del os.environ["VIO_CHECK_CAMS"]
-    assert metrics["check_cams"] == [1, 2]
-    names = [name for name, *_ in checks]
-    assert "quadrant coverage camb" in names
-    assert "quadrant coverage camd" not in names
-    failed = [name for name, ok, _msg, strict in checks
-              if strict and not ok]
-    assert failed == [], f"strict failures with the tracked pair: {failed}"
-    assert metrics["peak"]["px_formula"] <= cfg.trackable_px
-    print(f"PASS  nv180: VIO_CHECK_CAMS=1,2 - all strict checks pass, "
-          f"px formula {metrics['peak']['px_formula']:.1f} <= "
-          f"{cfg.trackable_px:.0f}")
 
 
 def main():
