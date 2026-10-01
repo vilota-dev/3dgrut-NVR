@@ -774,7 +774,8 @@ def build_vio_trajectory(gui, name_hint="Quad", flip=False):
         view[:3, :3] = R_gl
         view[:3, 3] = -R_gl @ eye
         poses = nvr.add_pose_to_trajectory(view, origin)
-    gui.orbit_first_pose = {c: 0 for c in range(4)}
+    # keys are the device's sockets (DP180 0-3, NV180 1-3), not a fixed 0-3
+    gui.orbit_first_pose = {c: 0 for c in nvr.get_all_cameras()}
     print(f"[vio] {cfg.n_frames} frames ({cfg.n_frames + 1} poses incl. the "
           f"unrendered tail) into the trajectory")
     return poses
