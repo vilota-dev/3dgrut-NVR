@@ -12,6 +12,10 @@ Run:  python tests/test_estimate_theta_star.py
 Fails (AssertionError) if the round trip is worse than 1e-5 rad or 0.01 px,
 if the lookup still inverts the pre-fix theta^2 polynomial, or if radii past
 the lookup table extrapolate beyond pi.
+
+Section 7 covers NV180V2 CamD (narrow KB4 whose polynomial turns over and
+dives below zero inside [0, pi]): the LUT must be truncated to its monotonic
+prefix or every pixel collapses to one theta_star (radial starburst).
 """
 import json
 import math
@@ -26,8 +30,8 @@ sys.path.insert(0, REPO)
 from threedgrut_playground.utils.kaolin_future.fisheye import estimate_theta_star  # noqa: E402
 
 
-def load_cam(idx):
-    with open(os.path.join(REPO, "calibration_files", "vk180.json")) as f:
+def load_cam(idx, filename="vk180.json"):
+    with open(os.path.join(REPO, "calibration_files", filename)) as f:
         calib = json.load(f)
     for cam_id, cam in calib["cameraData"]:
         if cam_id == idx:
@@ -224,6 +228,70 @@ def main():
               f"({math.degrees(ru_c):.2f} deg)")
         print(f"      correct theta = {th_bis:.4f} rad ({math.degrees(th_bis):.2f} deg), "
               f"delta = {ru_c - th_bis:+.4f} rad")
+
+    # ---------------------------------------------------------------- #
+    # 7. NV180V2 CamD: narrow KB4 whose polynomial turns over            #
+    # ---------------------------------------------------------------- #
+    hr("7. NV180V2 CamD (socket 3): narrow KB4, polynomial dives past turnover")
+    kd, (dfx, dfy, dcx, dcy), dw, dh = load_cam(3, "NV180V2-80.121.0230.json")
+    print(f"CamD: {dw}x{dh}  fx={dfx:.1f}  k={[round(v, 5) for v in kd]}")
+
+    # Where this fit stops being invertible, and how far d(theta) dives
+    th2 = torch.linspace(0.0, math.pi, 200001, dtype=torch.float64)
+    dturn = torch.nonzero(dru_dtheta(th2, kd) <= 0)
+    theta_turn_d = th2[dturn[0, 0]].item() if len(dturn) else math.pi
+    ru_turn_d = forward_ru(torch.tensor(theta_turn_d, dtype=torch.float64), kd).item()
+    ru_pi_d = forward_ru(torch.tensor(math.pi, dtype=torch.float64), kd).item()
+    print(f"turnover at theta = {theta_turn_d:.4f} rad ({math.degrees(theta_turn_d):.1f} deg), "
+          f"ru = {ru_turn_d:.4f};  d(pi) = {ru_pi_d:.1f}")
+    print("with d(pi) < 0, an untruncated LUT would clamp(ru, 0, d(pi)) and")
+    print("collapse every pixel to the same theta -> radial starburst.")
+
+    # The whole sensor sits inside the monotonic region -> must round-trip
+    ru_corner_d = math.hypot(max(dcx, dw - dcx) / dfx, max(dcy, dh - dcy) / dfy)
+    lo, hi = 0.0, theta_turn_d
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if forward_ru(torch.tensor(mid, dtype=torch.float64), kd).item() < ru_corner_d:
+            lo = mid
+        else:
+            hi = mid
+    theta_corner_d = 0.5 * (lo + hi)
+    print(f"corner: ru = {ru_corner_d:.4f}, theta = {theta_corner_d:.4f} rad "
+          f"({math.degrees(theta_corner_d):.2f} deg)")
+
+    theta_in_d = torch.linspace(0.0, theta_corner_d, 25, dtype=torch.float64)
+    ru_in_d = forward_ru(theta_in_d, kd)
+    theta_out_d = estimate_theta_star(kd[0], kd[1], kd[2], kd[3], ru=ru_in_d,
+                                      device=ru_in_d.device, dtype=ru_in_d.dtype)
+    err_d = theta_out_d - theta_in_d
+    max_rad_d = err_d.abs().max().item()
+    max_px_d = max(abs(e.item() * dru_dtheta(a, kd).item() * dfx)
+                   for a, e in zip(theta_in_d, err_d))
+    print(f"round trip over the sensor: max |err| = {max_rad_d:.4e} rad = {max_px_d:.4f} px")
+    assert max_rad_d < 1e-5 and max_px_d < 0.01, (
+        f"CamD round trip error {max_rad_d:.3e} rad / {max_px_d:.3f} px exceeds "
+        f"1e-5 rad / 0.01 px (starburst: all pixels share one theta_star)")
+    assert len(torch.unique(theta_out_d)) > 1, (
+        "CamD theta_star is constant across the sensor (radial starburst)")
+
+    # float32, as the GUI computes it
+    ru32 = ru_in_d.to(torch.float32)
+    theta_out32 = estimate_theta_star(kd[0], kd[1], kd[2], kd[3], ru=ru32,
+                                      device=ru32.device, dtype=ru32.dtype)
+    err32 = (theta_out32.to(torch.float64) - theta_in_d).abs().max().item()
+    print(f"float32 (GUI dtype): max |err| = {err32:.4e} rad")
+    assert err32 < 1e-4, f"CamD float32 round trip error {err32:.3e} rad exceeds 1e-4"
+
+    # Radii past the turnover must saturate near the turnover angle
+    probes_d = torch.tensor([ru_turn_d * 1.05, 10.0], dtype=torch.float64)
+    sat = estimate_theta_star(kd[0], kd[1], kd[2], kd[3], ru=probes_d,
+                              device=probes_d.device, dtype=probes_d.dtype)
+    print(f"ru past turnover -> theta_star = {[round(v, 4) for v in sat.tolist()]} "
+          f"(turnover = {theta_turn_d:.4f})")
+    assert torch.isfinite(sat).all() and (sat >= 0).all() and \
+        (sat <= theta_turn_d + 1e-2).all(), (
+        "CamD theta_star for out-of-range radii does not saturate at the turnover")
 
 
 if __name__ == "__main__":
