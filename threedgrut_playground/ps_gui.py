@@ -593,6 +593,9 @@ class Playground:
             if psim.Button("Load Calibration"):
                 try:
                     self.novel_view_renderer.load_device()
+                    # Reset the selection: the new device's sockets may not
+                    # include the previously selected one (NV180 has no 0)
+                    self.selected_camera_idx = None
                     self.calibration_loaded = True  # Set the flag to indicate that calibration is loaded
                     self._novel_view_calib_status = f"Loaded {self.novel_view_renderer.get_camera_count()} cameras from {calibration_path}"
                     self.distortions = self.novel_view_renderer.get_cam_distortions()
@@ -630,8 +633,14 @@ class Playground:
             
             
             if getattr(self, "selected_camera_idx", None) is None:
-                # If no camera is selected, select the first one by default
-                self.selected_camera_idx = 0    
+                # If no camera is selected, select the first one by default.
+                # "First" is the lowest socket PRESENT: sockets need not
+                # start at 0 (NV180 is 1, 2, 3; DP180 keeps 0).
+                if self.novel_view_renderer.is_loaded():
+                    self.selected_camera_idx = min(
+                        self.novel_view_renderer.get_all_cameras())
+                else:
+                    self.selected_camera_idx = 0
             if getattr(self, "trajectory_loaded", None) is None:
                  self.trajectory_loaded = False
             
@@ -730,10 +739,20 @@ class Playground:
                             curr_cam_index = self.selected_camera_idx
                             self.poses = self.novel_view_renderer.add_pose_to_trajectory(current_cam_view_mat, curr_cam_index)
                         if psim.TreeNode(f"Trajectory: {len(self.poses)} poses"):
-                            _, self.export_cam_index = psim.SliderInt(
-                                "Choose Cam", self.export_cam_index, v_min=0, v_max=self.novel_view_renderer.get_camera_count() - 1
+                            # The slider runs over positions in the sorted
+                            # socket list, not raw socket numbers: a 3-camera
+                            # NV180 rig is sockets 1, 2, 3. For DP180 (0-3)
+                            # position == socket, exactly as before.
+                            sockets = sorted(
+                                self.novel_view_renderer.get_all_cameras())
+                            if self.export_cam_index not in sockets:
+                                self.export_cam_index = sockets[0]
+                            _, cam_pos = psim.SliderInt(
+                                "Choose Cam", sockets.index(self.export_cam_index),
+                                v_min=0, v_max=len(sockets) - 1
                             )
-                            
+                            self.export_cam_index = sockets[cam_pos]
+
                             psim.NewLine()
                             if psim.Button("Render Current Cam Trajectory PNGS"):
                                 self.video_recorder.export_format = "png"
@@ -1662,22 +1681,25 @@ class Playground:
         self.mcap_convertor.output_filename = "long_final_path.mcap"
         self.mcap_convertor.set_filepath()
         interval = self.mcap_convertor.calculate_time_interval()
-        cam_names = ["CamA", "CamB", "CamC", "CamD"]
-        # Render a subset. Set to None for all four.
+        # The sockets present in the loaded calibration, in order. DP180
+        # gives 0-3 (CamA..CamD, as the old hard-coded list did); a 3-camera
+        # NV180 rig gives 1-3 (CamB..CamD).
+        cam_indices = sorted(self.novel_view_renderer.get_all_cameras())
+        # Render a subset of camera names. Set to None for all.
         only_cams = None
         with open (self.mcap_convertor.output_fullpath, 'wb') as stream:
             writer = Writer(stream)
             writer.start(profile = "VisualKit")
             channels ={}
             num_frames = self.video_recorder.get_num_frames(len(poses)) # change to get this frm self.vid_recorder
-            for cam_name in cam_names:
+            for index in cam_indices:
+                cam_name = self.novel_view_renderer.get_cam_name_at_index(index)
                 if only_cams and cam_name not in only_cams:
                     continue
                 time_stamp = 0
                 self.video_recorder.reset_for_new_cam_path_export()
-                
-                # Now populate according to the cam name
-                index = cam_names.index(cam_name)
+
+                # Now populate according to the camera socket
                 self.populate_vid_trajectory(poses, idx=index)
                 for i in trange(num_frames, desc = f"Writing frames for {cam_name}"):
                     frame = self.video_recorder.obtain_single_camera_frame(frame_index=i, cam_name=cam_name)
