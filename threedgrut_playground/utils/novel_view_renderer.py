@@ -191,7 +191,9 @@ class NovelViewRenderer:
     @ensure_loaded
     def get_cam_name_at_index(self, index: int) -> str:
         """Returns the camera name at the specified index."""
-        if index < 0 or index >= self.v_device.get_camera_count():
+        # index is the rig socket: validate against the sockets present, not
+        # the camera count (a 3-camera NV180 rig has sockets 1, 2, 3).
+        if index not in self.v_device.get_all_cameras():
             raise IndexError(f"Camera index {index} out of range.")
         return self.v_device.get_cam_name(index)
     
@@ -336,8 +338,8 @@ class NovelViewRenderer:
     
     
     @ensure_loaded
-    def get_cam_distortions(self) -> List[float]:
-        """Returns a list of distortion coefficients for all cameras."""
+    def get_cam_distortions(self) -> dict:
+        """Returns the distortion coefficients per camera, keyed by socket."""
         return self.v_device.get_cam_distortions()
     
     @ensure_loaded
@@ -441,18 +443,13 @@ class VilotaDevice:
         else:
             raise ValueError(f"Unknown camera index {index} for device {self.name}.")
     
-    def get_cam_distortions(self) -> List[float]:
-        """ Returns a list of distortion coefficients for all cameras. """
-        distortions = []
-        for camera in self.cameras.values():
-            if hasattr(camera, 'distortion_coefficients'):
-                dist = camera.distortion_coefficients
-                distortions.append(dist)
-                
-            else:
-                distortions.append(None)
-
-        return distortions
+    def get_cam_distortions(self) -> dict:
+        """ Returns the distortion coefficients per camera, keyed by rig
+        socket. Callers index this by socket (selected_camera_idx), which a
+        positional list got wrong whenever the sockets do not start at 0.
+        For 0-3 rigs the integer lookups behave exactly as before. """
+        return {index: getattr(camera, 'distortion_coefficients', None)
+                for index, camera in self.cameras.items()}
     
     def check_rig_layout(self, world_to_camd, world_to_cami, i):
     # world_to_camd : Get the world to cam of cam D
