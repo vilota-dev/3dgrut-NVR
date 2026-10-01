@@ -279,6 +279,18 @@ def estimate_theta_star(
     d = lambda theta: theta + k1 * theta**3 + k2 * theta**5 + k3 * theta**7 + k4 * theta**9
     R = d(theta_vals)  # (num_steps,)
 
+    # A narrow-lens KB4 fit is only valid while d(theta) still increases;
+    # past its turnover the polynomial can dive below zero (NV180 CamD:
+    # d(pi) ~ -9.8e4), and clamp(ru, R[0], R[-1]) with R[-1] < R[0] would
+    # collapse every radius to one value. Also, searchsorted requires a
+    # sorted table. Keep the strictly increasing prefix, so radii past the
+    # turnover saturate at the turnover angle instead.
+    non_increasing = torch.nonzero(R[1:] <= R[:-1])
+    if len(non_increasing):
+        end = max(int(non_increasing[0, 0]) + 1, 2)
+        theta_vals = theta_vals[:end]
+        R = R[:end]
+
     # ru: (...), need to find theta_star for each ru
     # Use torch.searchsorted (PyTorch >= 1.6)
     ru_clamped = torch.clamp(ru, R[0], R[-1])
