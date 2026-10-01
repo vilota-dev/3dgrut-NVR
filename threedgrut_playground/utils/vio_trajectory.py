@@ -42,6 +42,13 @@ keep working; ARM_REACH is ignored here because clamping breaks C2):
   VIO_FPS              frame rate, default 20 (also sets PLAYGROUND_FPS so
                        the mcap export stamps at the same rate)
   TRACKABLE_PX         per-frame displacement ceiling, default 50 px
+  VIO_CHECK_CAMS       comma-separated sockets VIO tracks (e.g. 1,2 for
+                       the NV180's nv180_minimal camb+camc pair). They
+                       replace the default coverage-check set (every KB4
+                       camera except socket 0), and the TRACKABLE_PX
+                       design formula then uses the largest focal among
+                       them instead of the whole rig's. Unset: the
+                       historical behaviour, byte for byte.
   VIO_TRAJ_NPZ         ground-truth output, default mcap_outputs/vio_truth.npz
   VIO_WAYPOINTS        waypoint file (same formats as --waypoints below).
                        build_vio_trajectory then renders the C2 spline
@@ -441,6 +448,57 @@ def _spike_ratio(mag, motion_mask):
     return float(m.max() / max(np.percentile(m, 95.0), 1e-9))
 
 
+def _kb4_fold_theta(p, n=3141):
+    """First turnover of the KB4 radial polynomial d(theta) on (0, pi]:
+    past it the fit folds back toward the axis, so a direction can project
+    inside the image bounds without lying in the field of view (the same
+    non-monotonicity fisheye.estimate_theta_star truncates its LUT away
+    from). pi when the polynomial is monotonic over the whole range."""
+    th = np.linspace(0.0, math.pi, n)
+    t2 = th * th
+    d = th * (1 + t2 * (p["k1"] + t2 * (p["k2"] + t2 * (p["k3"] + t2 * p["k4"]))))
+    bad = np.nonzero(np.diff(d) <= 0)[0]
+    return float(th[bad[0]]) if len(bad) else math.pi
+
+
+def _dirs_in_image(dirs, cam):
+    """(mask, px) for unit directions that genuinely image inside cam: the
+    projection-loop predicate (model validity, z > 0, pixel in bounds)
+    plus, for KB4, theta below the fit's fold angle."""
+    px, ok = _project(dirs, cam)
+    ok = ok & (dirs[:, 2] > 0)
+    if cam["model"] == "kb4":
+        theta = np.arccos(np.clip(dirs[:, 2], -1.0, 1.0))
+        ok = ok & (theta < _kb4_fold_theta(cam["params"]))
+    w, h = cam["width"], cam["height"]
+    return (ok & (px[:, 0] >= 0) & (px[:, 0] < w)
+               & (px[:, 1] >= 0) & (px[:, 1] < h)), px
+
+
+def _reachable_quadrants(cam, ref_cam):
+    """(4,) bool: the quadrants of cam that board corners can occupy AT ALL
+    while the strict 'boards inside reference cam' invariant holds - the
+    reference camera's image cone, rotated into cam and projected with
+    cam's own model. Deterministic Fibonacci-sphere sweep; the few-cm
+    translations between the rig cameras are negligible against board
+    distances in metres at quadrant granularity."""
+    n = 20000
+    i = np.arange(n)
+    phi = math.pi * (3.0 - math.sqrt(5.0)) * i
+    z = 1.0 - 2.0 * (i + 0.5) / n
+    r = np.sqrt(np.maximum(1.0 - z * z, 0.0))
+    dirs = np.stack([r * np.cos(phi), r * np.sin(phi), z], axis=1)
+    inside, _ = _dirs_in_image(dirs, ref_cam)
+    T_cam_ref = np.linalg.inv(cam["T_camd_cam"])
+    inside, px = _dirs_in_image(dirs[inside] @ T_cam_ref[:3, :3].T, cam)
+    u, v = px[inside, 0], px[inside, 1]
+    cx, cy = cam["params"]["cx"], cam["params"]["cy"]
+    return np.array([bool(((u < cx) & (v < cy)).any()),
+                     bool(((u >= cx) & (v < cy)).any()),
+                     bool(((u < cx) & (v >= cy)).any()),
+                     bool(((u >= cx) & (v >= cy)).any())])
+
+
 def run_checks(cfg, geom, rig, ref_sock, times, eyes, R_wc, check_cams=None):
     """Evaluate every path check without raising.
 
@@ -454,9 +512,20 @@ def run_checks(cfg, geom, rig, ref_sock, times, eyes, R_wc, check_cams=None):
     n = len(times)
     dt = 1.0 / cfg.fps
     pts_w = geom.cloud
+    track_cams = list(rig)
     if check_cams is None:
-        check_cams = [s for s, c in rig.items()
-                      if c["model"] == "kb4" and s != 0]
+        env_cams = os.environ.get("VIO_CHECK_CAMS")
+        if env_cams:
+            check_cams = [int(t) for t in env_cams.replace(",", " ").split()]
+            bad = [s for s in check_cams if s not in rig]
+            if bad:
+                raise ValueError(
+                    f"VIO_CHECK_CAMS={env_cams}: socket(s) {bad} not in "
+                    f"the rig (has {sorted(rig)})")
+            track_cams = check_cams
+        else:
+            check_cams = [s for s, c in rig.items()
+                          if c["model"] == "kb4" and s != 0]
 
     dists = np.linalg.norm(eyes - geom.center, axis=1)
     band_w = geom.d_far - geom.d_near
@@ -524,10 +593,21 @@ def run_checks(cfg, geom, rig, ref_sock, times, eyes, R_wc, check_cams=None):
 
     for s in check_cams:
         c = cov[s]
+        # Only demand quadrants the rig geometry can reach: a camera
+        # mounted off the reference axis (NV180 camc, 20 deg pitch vs the
+        # 18.5 deg half-field narrow reference) can never image boards in
+        # quadrants the reference cone does not map into.
+        reach = _reachable_quadrants(rig[s], rig[ref_sock])
+        if reach.all():
+            msg = (f"socket {s}: quadrant counts {c['quad'].tolist()} - "
+                   f"not all four")
+        else:
+            msg = (f"socket {s}: quadrant counts {c['quad'].tolist()} - "
+                   f"reachable quadrants {np.flatnonzero(reach).tolist()} "
+                   f"not all covered (the rest are unreachable from the "
+                   f"reference camera's cone)")
         checks.append((f"quadrant coverage cam{'abcd'[s]}",
-                       bool((c["quad"] > 0).all()),
-                       f"socket {s}: quadrant counts {c['quad'].tolist()} - not all four",
-                       True))
+                       bool((c["quad"][reach] > 0).all()), msg, True))
         checks.append((f"both bands seen by cam{'abcd'[s]}",
                        bool(c["near"] > 0 and c["far"] > 0),
                        f"socket {s}: corners missing from a distance band "
@@ -549,7 +629,11 @@ def run_checks(cfg, geom, rig, ref_sock, times, eyes, R_wc, check_cams=None):
     # trackability: focal x angular step + translation flow at the nearest
     # board point, per frame (the design formula), plus the measured corner
     # step from the projections above. Both must clear TRACKABLE_PX.
-    f_max = max(c["params"]["fx"] for c in cams.values())
+    # The focal ranges over the cameras the tracker consumes: the whole
+    # rig by default, or the VIO_CHECK_CAMS sockets when declared (the
+    # NV180's untracked camd, fx 4263, would otherwise bound a camera VIO
+    # never sees).
+    f_max = max(cams[s]["params"]["fx"] for s in track_cams)
     d_min = np.array([np.linalg.norm(pts_w - eyes[i], axis=1).min()
                       for i in range(n)])
     dth = np.linalg.norm(wvec, axis=1) * dt
@@ -594,10 +678,12 @@ def run_checks(cfg, geom, rig, ref_sock, times, eyes, R_wc, check_cams=None):
 def verify_path(cfg, geom, rig, ref_sock, times, eyes, R_wc, check_cams=None):
     """All path checks; raises AssertionError on any violation.
 
-    Returns a metrics dict and prints the summary table. check_cams: KB4
-    sockets that must reach all four image quadrants and both distance
-    bands (default: every KB4 camera except socket 0 - camA points away
-    from the boards on this product and is not consumed by the driver).
+    Returns a metrics dict and prints the summary table. check_cams:
+    sockets that must cover every geometrically reachable image quadrant
+    (see _reachable_quadrants) and both distance bands. Default: the
+    VIO_CHECK_CAMS env sockets, else every KB4 camera except socket 0
+    (camA points away from the boards on the DP180 and is not consumed
+    by the driver).
     """
     metrics, checks = run_checks(cfg, geom, rig, ref_sock, times, eyes,
                                  R_wc, check_cams)
