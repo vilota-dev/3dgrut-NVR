@@ -39,15 +39,21 @@ pg = Playground(
 log("playground constructed")
 
 # --- Load Calibration -------------------------------------------------- #
-pg.novel_view_renderer.calibration_filename = 'vk180.json'
-pg.novel_view_renderer.calibration_fullpath = './calibration_files/vk180.json'
+# DRIVE_CALIB picks another file from calibration_files/ (e.g. the 3-camera
+# NV180V2-80.121.0230.json); unset keeps the vk180.json run unchanged.
+CALIB_NAME = os.environ.get('DRIVE_CALIB', 'vk180.json')
+pg.novel_view_renderer.calibration_filename = CALIB_NAME
+pg.novel_view_renderer.calibration_fullpath = './calibration_files/' + CALIB_NAME
 pg.novel_view_renderer.load_device()
 pg.calibration_loaded = True
 pg.distortions = pg.novel_view_renderer.get_cam_distortions()
 n_cams = pg.novel_view_renderer.get_camera_count()
-log(f"calibration loaded: {n_cams} cameras from ./calibration_files/vk180.json")
+rig_sockets = sorted(pg.novel_view_renderer.get_all_cameras())
+pg.selected_camera_idx = rig_sockets[0]
+log(f"calibration loaded: {n_cams} cameras (sockets {rig_sockets}) from "
+    f"./calibration_files/{CALIB_NAME}")
 log(f"device: {pg.novel_view_renderer.get_device_name_and_serial_no()}")
-for i in range(n_cams):
+for i in rig_sockets:
     cam = pg.novel_view_renderer.get_camera_at_index(i)
     fx, fy, cx, cy = cam.get_camera_intrinsics()
     log(f"  cam{i} {pg.novel_view_renderer.get_cam_name_at_index(i)} "
@@ -104,10 +110,10 @@ log("only_cams = None (all four cameras)")
 
 # --- pre-flight: every camera must carry ITS OWN intrinsics + distortion - #
 import json
-calib = json.load(open('calibration_files/vk180.json'))
+calib = json.load(open('calibration_files/' + CALIB_NAME))
 by_id = {cid: c for cid, c in calib['cameraData']}
-names = ["CamA", "CamB", "CamC", "CamD"]
-for idx, nm in enumerate(names):
+for idx in sorted(by_id):
+    nm = pg.novel_view_renderer.get_cam_name_at_index(idx)
     pg.video_recorder.reset_for_new_cam_path_export()
     pg.populate_vid_trajectory(poses[:2], idx=idx)
     c = pg.video_recorder.trajectory[0]
@@ -125,7 +131,7 @@ for idx, nm in enumerate(names):
         f"d[5]={d[5]:.4f} intr={'OK' if ok_i else 'MISMATCH'} dist={'OK' if ok_d else 'MISMATCH'}")
     assert ok_i and ok_d, f"{nm} carries the wrong camera's parameters"
 pg.video_recorder.reset_for_new_cam_path_export()
-log("pre-flight pass: all four cameras carry their own intrinsics and distortion")
+log("pre-flight pass: every camera carries its own intrinsics and distortion")
 
 # --- Render Device Trajectory MCAP -------------------------------------- #
 log("starting render")
