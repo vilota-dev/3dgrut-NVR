@@ -33,7 +33,7 @@ sys.path.insert(0, REPO)
 
 for var in ("VIO_TRAJ", "STATIONARY_LEAD_S", "VIO_MOTION_S", "VIO_FPS",
             "TRACKABLE_PX", "VIO_TRAJ_NPZ", "ORBIT_DIST", "ORBIT_TARGET",
-            "ORBIT_FLIP", "ARM_REACH"):
+            "ORBIT_FLIP", "ARM_REACH", "VIO_CHECK_CAMS"):
     os.environ.pop(var, None)
 
 from threedgrut_playground.utils.boards import (
@@ -137,11 +137,83 @@ def run_scene(tag, cloud, center, normal, rig, ref):
     return metrics
 
 
+NV_CALIB = os.path.join(REPO, "calibration_files", "NV180V2-80.121.0230.json")
+
+
+def run_nv180():
+    """NV180 (narrow KB4 reference, camc pitched 20 deg off it):
+      5. _reachable_quadrants is exact on both rigs - NV180 camc can only
+         reach its upper half, camb its left column, while every DP180
+         checked camera keeps all four (so the DP180 checks are untouched);
+         the camd fit's fold angle (the starburst polynomial) is honoured.
+      6. The default checks pass camc on its reachable quadrants (the old
+         all-four rule failed on [n, n, 0, 0]) and still fail the px
+         formula on the whole-rig focal (untracked camd, fx 4263).
+      7. VIO_CHECK_CAMS=1,2 (the nv180_minimal tracked pair) scopes the
+         coverage checks and the trackability focal: every strict check
+         passes."""
+    rig, ref = vt.load_rig(NV_CALIB)
+    assert ref == 3 and rig[ref]["model"] == "kb4"
+
+    th = vt._kb4_fold_theta(rig[3]["params"])
+    assert 0.69 < th < 0.71, f"camd fold angle {th:.3f} rad, expected ~0.700"
+    masks = {s: vt._reachable_quadrants(rig[s], rig[ref]).tolist()
+             for s in sorted(rig)}
+    assert masks == {1: [True, False, True, False],
+                     2: [True, True, False, False],
+                     3: [True, True, True, True]}, masks
+    dp_rig, dp_ref = vt.load_rig(CALIB)
+    for s in (1, 2):   # the DP180 default check set must stay all-four
+        m = vt._reachable_quadrants(dp_rig[s], dp_rig[dp_ref])
+        assert m.all(), f"DP180 socket {s} reachable mask {m.tolist()}"
+    print("PASS  nv180: reachable-quadrant masks exact on both rigs, "
+          f"camd fold angle {math.degrees(th):.1f} deg")
+
+    cfg = vt.VioConfig()
+    cloud = vt._default_cloud()
+    center = 0.5 * (cloud.min(0) + cloud.max(0))
+    geom = vt.PathGeometry(cloud, center, np.array([0.0, 0.0, 1.0]),
+                           rig[ref])
+    times, eyes, R_wc = vt.sample_path(cfg, geom)
+
+    metrics, checks = vt.run_checks(cfg, geom, rig, ref, times, eyes, R_wc)
+    by = {name: ok for name, ok, _msg, _strict in checks}
+    q = metrics["coverage"][2]["quad"]
+    assert q[0] > 0 and q[1] > 0 and q[2] == 0 and q[3] == 0, q.tolist()
+    assert by["quadrant coverage camc"], \
+        "camc must pass on its reachable upper half"
+    assert by["quadrant coverage camd"]
+    assert not by["px formula <= ceiling"], \
+        "whole-rig focal (camd fx 4263) must still bound the default"
+    print(f"PASS  nv180: default checks - camc passes on quadrants "
+          f"{q.tolist()}, px formula honestly fails at "
+          f"{metrics['peak']['px_formula']:.1f} px")
+
+    os.environ["VIO_CHECK_CAMS"] = "1,2"
+    try:
+        metrics, checks = vt.run_checks(cfg, geom, rig, ref, times, eyes,
+                                        R_wc)
+    finally:
+        del os.environ["VIO_CHECK_CAMS"]
+    assert metrics["check_cams"] == [1, 2]
+    names = [name for name, *_ in checks]
+    assert "quadrant coverage camb" in names
+    assert "quadrant coverage camd" not in names
+    failed = [name for name, ok, _msg, strict in checks
+              if strict and not ok]
+    assert failed == [], f"strict failures with the tracked pair: {failed}"
+    assert metrics["peak"]["px_formula"] <= cfg.trackable_px
+    print(f"PASS  nv180: VIO_CHECK_CAMS=1,2 - all strict checks pass, "
+          f"px formula {metrics['peak']['px_formula']:.1f} <= "
+          f"{cfg.trackable_px:.0f}")
+
+
 def main():
     rig, ref = vt.load_rig(CALIB)
     assert rig[ref]["model"] == "ds", "reference camera should be DS here"
     run_scene("single-board 30cm", *scene_single(), rig, ref)
     run_scene("default 3-board 15cm", *scene_default(), rig, ref)
+    run_nv180()
     print("\nall vio trajectory checks passed")
 
 
