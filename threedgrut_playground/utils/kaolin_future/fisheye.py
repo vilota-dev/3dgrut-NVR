@@ -276,13 +276,25 @@ def estimate_theta_star(
 
     num_steps = int((math.pi - 0.0) / step_size)
     theta_vals = torch.linspace(0.0, math.pi, steps=num_steps, device=device, dtype=dtype)
-    d = lambda theta: theta + k1 * theta**2 + k2 * theta**5 + k3 * theta**7 + k4 * theta**9
+    d = lambda theta: theta + k1 * theta**3 + k2 * theta**5 + k3 * theta**7 + k4 * theta**9
     R = d(theta_vals)  # (num_steps,)
+
+    # A narrow-lens KB4 fit is only valid while d(theta) still increases;
+    # past its turnover the polynomial can dive below zero (NV180 CamD:
+    # d(pi) ~ -9.8e4), and clamp(ru, R[0], R[-1]) with R[-1] < R[0] would
+    # collapse every radius to one value. Also, searchsorted requires a
+    # sorted table. Keep the strictly increasing prefix, so radii past the
+    # turnover saturate at the turnover angle instead.
+    non_increasing = torch.nonzero(R[1:] <= R[:-1])
+    if len(non_increasing):
+        end = max(int(non_increasing[0, 0]) + 1, 2)
+        theta_vals = theta_vals[:end]
+        R = R[:end]
 
     # ru: (...), need to find theta_star for each ru
     # Use torch.searchsorted (PyTorch >= 1.6)
-    #ru_clamped = torch.clamp(ru, R[0], R[-1])
-    idx = torch.searchsorted(R, ru) - 1
+    ru_clamped = torch.clamp(ru, R[0], R[-1])
+    idx = torch.searchsorted(R, ru_clamped) - 1
     idx = torch.clamp(idx, 0, len(R) - 2)
 
     r0 = R[idx]
@@ -290,7 +302,7 @@ def estimate_theta_star(
     theta0 = theta_vals[idx]
     theta1 = theta_vals[idx + 1]
 
-    theta_star = theta0 + (ru - r0) * (theta1 - theta0) / (r1 - r0 + 1e-12) #interpolate to get the theta in between by that ratio
+    theta_star = theta0 + (ru_clamped - r0) * (theta1 - theta0) / (r1 - r0 + 1e-12) #interpolate to get the theta in between by that ratio
 
     return theta_star
 
@@ -362,7 +374,6 @@ def generate_rays_kb4(
         device=ru.device,
         dtype=ru.dtype
     )
-    theta_star = ru
 
     sin_t = torch.sin(theta_star)
     cos_t = torch.cos(theta_star)
