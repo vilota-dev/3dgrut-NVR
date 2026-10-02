@@ -159,9 +159,12 @@ def run_nv180():
          reach its upper half, camb its left column, while every DP180
          checked camera keeps all four (so the DP180 checks are untouched);
          the camd fit's fold angle (the starburst polynomial) is honoured.
-      6. The default checks pass camc on its reachable quadrants (the old
-         all-four rule failed on [n, n, 0, 0]) and still fail the px
-         formula on the whole-rig focal (untracked camd, fx 4263).
+      6. The default checks derive the tracked pair (camb, camc) from
+         the rig: camc passes on its reachable quadrants (the old
+         all-four rule failed on [n, n, 0, 0]), camd gets no coverage
+         rows, the px formula is bounded by the tracked focal - and the
+         reference-framed far design still cannot pass, because the
+         scene-plausibility rows fail it.
       7. VIO_CHECK_CAMS=1,2 (the nv180_minimal tracked pair) frames the
          path in camc (select_framing), bringing the bands into the room
          (DP180's range, not 22..35 m): every strict check passes,
@@ -169,7 +172,12 @@ def run_nv180():
       8. Regression: with the tracked cameras declared, the old
          reference-framed far path fails 'bands within the fit cone' AND
          'peak speed plausible' - a path that leaves the scene can no
-         longer pass."""
+         longer pass.
+      9. tracked_sockets derives {1,2} on the NV180 and {1,2,3} on the
+         DP180 (check rows [camc, camb], the historical order and
+         scoping values); plan_framing keeps the DP180's reference
+         design bit for bit and gives the NV180 the camc-framed design
+         with no knob - identical to the VIO_CHECK_CAMS=1,2 path."""
     rig, ref = vt.load_rig(NV_CALIB)
     assert ref == 3 and rig[ref]["model"] == "kb4"
 
@@ -200,19 +208,24 @@ def run_nv180():
     assert q[0] > 0 and q[1] > 0 and q[2] == 0 and q[3] == 0, q.tolist()
     assert by["quadrant coverage camc"], \
         "camc must pass on its reachable upper half"
-    assert by["quadrant coverage camd"]
-    assert not by["px formula <= ceiling"], \
-        "whole-rig focal (camd fx 4263) must still bound the default"
+    assert sorted(metrics["check_cams"]) == [1, 2], \
+        f"derived check set {metrics['check_cams']}: camd is the " \
+        f"reference and a navigation lens, camb+camc are tracked"
+    assert "quadrant coverage camd" not in by, \
+        "the untracked camd must get no coverage rows by default"
+    assert by["px formula <= ceiling"], \
+        f"tracked focal (camc fx 678) bounds the default run " \
+        f"({metrics['peak']['px_formula']:.1f} px)"
     # armed for every rig: the reference-framed far design must fail the
     # scene-plausibility rows even without VIO_CHECK_CAMS
     assert not by["bands within the fit cone"], \
         f"{geom.d_far / geom.d_fit:.1f}x fit must fail the cone check"
     assert not by["peak speed plausible"], \
         f"{metrics['peak']['v']:.2f} m/s must fail the speed ceiling"
-    print(f"PASS  nv180: default checks - camc passes on quadrants "
-          f"{q.tolist()}, px formula honestly fails at "
-          f"{metrics['peak']['px_formula']:.1f} px, and the far design "
-          f"fails both scene-plausibility rows")
+    print(f"PASS  nv180: default checks - derived pair {{1,2}}, camc "
+          f"passes on quadrants {q.tolist()}, px formula "
+          f"{metrics['peak']['px_formula']:.1f} px on the tracked focal, "
+          f"and the far design fails both scene-plausibility rows")
 
     os.environ["VIO_CHECK_CAMS"] = "1,2"
     try:
@@ -260,6 +273,44 @@ def run_nv180():
               f"scene-plausibility checks: {failed_b}")
     finally:
         del os.environ["VIO_CHECK_CAMS"]
+
+    # 9. derivation and framing with no knob set
+    socks, declared = vt.tracked_sockets(rig, ref)
+    assert not declared and sorted(socks) == [1, 2], socks
+    dp_socks, dp_declared = vt.tracked_sockets(dp_rig, dp_ref)
+    assert not dp_declared and sorted(dp_socks) == [1, 2, 3], dp_socks
+
+    up = np.array([0.0, 0.0, 1.0])
+    fs_dp, geom_dp = vt.plan_framing(dp_rig, dp_ref, cloud, center, up)
+    assert fs_dp is None, "the DP180's wide reference must keep framing"
+    g_ref = vt.PathGeometry(cloud, center, up, dp_rig[dp_ref])
+    assert (geom_dp.d_near, geom_dp.d_far, geom_dp.bud_x, geom_dp.bud_y) \
+        == (g_ref.d_near, g_ref.d_far, g_ref.bud_x, g_ref.bud_y), \
+        "DP180 derived design must equal the historical reference design"
+    t_dp, e_dp, R_dp = vt.sample_path(cfg, geom_dp)
+    m_dp, c_dp = vt.run_checks(cfg, geom_dp, dp_rig, dp_ref, t_dp, e_dp,
+                               R_dp)
+    assert m_dp["check_cams"] == [2, 1], \
+        f"DP180 derived rows {m_dp['check_cams']}: the historical order"
+    m_old, _ = vt.run_checks(cfg, geom_dp, dp_rig, dp_ref, t_dp, e_dp,
+                             R_dp, check_cams=[2, 1])  # whole-rig scoping
+    assert m_dp["peak"]["px_formula"] == m_old["peak"]["px_formula"]
+    assert m_dp["peak"]["px_measured"] == m_old["peak"]["px_measured"]
+    assert not [n for n, ok, _m, s in c_dp if s and not ok]
+    print("PASS  nv180: derived sets {1,2} / {1,2,3}; DP180 keeps the "
+          "reference design, rows [camc, camb] and px numbers unchanged")
+
+    # the NV180 with no knob == the VIO_CHECK_CAMS=1,2 framed design
+    fs_nv, geom_nv = vt.plan_framing(rig, ref, cloud, center, up)
+    assert fs_nv == 2, f"derived framing {fs_nv}: camc must take over"
+    t_nv, e_nv, R_nv = vt.sample_path(cfg, geom_nv)
+    assert np.array_equal(e_nv, eyes_f) and np.array_equal(R_nv, R_f), \
+        "derived design must equal the declared 1,2 design bit for bit"
+    _m_nv, c_nv = vt.run_checks(cfg, geom_nv, rig, ref, t_nv, e_nv, R_nv)
+    failed_nv = [n for n, ok, _m, s in c_nv if s and not ok]
+    assert failed_nv == [], failed_nv
+    print("PASS  nv180: derived default framed in camc, bit-identical "
+          "to the declared 1,2 path, all strict checks pass")
 
 
 def main():

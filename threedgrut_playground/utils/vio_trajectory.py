@@ -43,15 +43,22 @@ keep working; ARM_REACH is ignored here because clamping breaks C2):
                        the mcap export stamps at the same rate)
   TRACKABLE_PX         per-frame displacement ceiling, default 50 px
   VIO_CHECK_CAMS       comma-separated sockets VIO tracks (e.g. 1,2 for
-                       the NV180's nv180_minimal camb+camc pair). They
-                       replace the default coverage-check set (every KB4
-                       camera except socket 0), the TRACKABLE_PX design
-                       formula uses the largest focal among them, the
-                       analytic path frames the boards in the tracked
-                       camera closest to the reference axis
-                       (select_framing - a narrow reference no longer
-                       pushes the bands out of the room). Unset: the
-                       historical behaviour, byte for byte.
+                       the NV180's nv180_minimal camb+camc pair). An
+                       OVERRIDE: unset, the tracked set derives from
+                       the rig itself (tracked_sockets - every camera
+                       except socket 0 whose usable half field clears
+                       TRACK_MIN_HALF_FOV_DEG; DP180 -> camb+camc+camd,
+                       NV180 -> camb+camc). Tracked sockets are the
+                       coverage-check set (minus the reference, whose
+                       containment check already pins it), bound the
+                       TRACKABLE_PX formula's focal, and may frame the
+                       path: declared sockets frame in the one closest
+                       to the reference axis (select_framing), derived
+                       sets only when the reference-framed design
+                       leaves the fit cone (plan_framing - the DP180's
+                       wide reference keeps the historical design bit
+                       for bit; the narrow NV180 reference hands the
+                       framing to camc without any knob).
   VIO_MAX_SPEED        peak-speed ceiling [m/s] for the scene-
                        plausibility check, default 3.0. Checked on
                        every run, every rig: a design whose bands left
@@ -124,6 +131,16 @@ NEAR_BAND_F, FAR_BAND_F = 1.06, 2.1   # x the FIT_HALF_FOV fit distance
 AIM_MARGIN_X_DEG, AIM_MARGIN_Y_DEG = 8.0, 6.0
 EDGE_PAD_PX = 30.0      # usable-half-field solve stays this far inside
 
+# Scene-plausibility and derivation constants (judgement values; see the
+# module docstring). A camera whose usable half field is narrower than
+# TRACK_MIN_HALF_FOV_DEG on either axis is a navigation lens VIO never
+# tracks (NV180 camd: (19.3, 18.9) deg vs 42 deg+ for every tracked
+# camera on both rigs). FIT_CONE_MAX bounds how far past the board-fit
+# distance a design's far band may sit (DP180 default 2.4x, the broken
+# NV180 reference-framed design 35.4x).
+TRACK_MIN_HALF_FOV_DEG = 30.0
+FIT_CONE_MAX = 5.0
+
 
 # ---------------------------------------------------------------------------
 # Camera models (parameters always read from the device file, never guessed)
@@ -195,10 +212,37 @@ def load_rig(calib_path):
     return cams, ref
 
 
-def select_framing(rig, ref_sock):
+def tracked_sockets(rig, ref_sock):
+    """Sockets VIO tracks, and whether VIO_CHECK_CAMS declared them.
+
+    Declared (the env var, e.g. 1,2): validated and returned verbatim -
+    the override keeps its historical semantics byte for byte. Unset:
+    derived from the rig alone, in the rig's socket order - every
+    camera except socket 0 (the DP180's cama points away from the
+    boards and is not consumed by the driver) whose usable half field
+    clears TRACK_MIN_HALF_FOV_DEG on both axes. Narrower cameras (the
+    NV180's camd) are navigation lenses VIO never tracks. A rig of
+    nothing but narrow or socket-0 cameras falls back to every non-0
+    socket, then to the whole rig, so the checks never go empty."""
+    env = os.environ.get("VIO_CHECK_CAMS")
+    if env:
+        socks = [int(t) for t in env.replace(",", " ").split()]
+        bad = [s for s in socks if s not in rig]
+        if bad:
+            raise ValueError(f"VIO_CHECK_CAMS={env}: socket(s) {bad} not in "
+                             f"the rig (has {sorted(rig)})")
+        return socks, True
+    socks = [s for s in rig
+             if s != 0 and min(usable_half_angle(rig[s], 0),
+                               usable_half_angle(rig[s], 1))
+             >= TRACK_MIN_HALF_FOV_DEG]
+    return (socks or [s for s in rig if s != 0] or list(rig)), False
+
+
+def select_framing(rig, ref_sock, socks=None):
     """Socket of the tracked camera the analytic path frames the boards in.
 
-    VIO_CHECK_CAMS declares the sockets VIO tracks; the path then designs
+    The tracked sockets declare what VIO consumes; the path then designs
     its distance bands and aim budget around a TRACKED camera instead of
     the reference. A narrow reference (NV180 camd, 18.5 deg half field)
     would otherwise back the rig off until the boards fit its cone - 22 m
@@ -206,23 +250,61 @@ def select_framing(rig, ref_sock):
     whose optical axis lies closest to the reference axis wins (NV180:
     camc at 20.3 deg over camb at 75.5 deg): it keeps the rig attitude
     nearest the historical reference-centred conventions while its wide
-    field restores DP180-like distances. None when the env is unset or
-    the reference itself wins - the historical reference-framed design,
-    bit for bit."""
-    env = os.environ.get("VIO_CHECK_CAMS")
-    if not env:
-        return None
-    socks = [int(t) for t in env.replace(",", " ").split()]
-    bad = [s for s in socks if s not in rig]
-    if bad:
-        raise ValueError(f"VIO_CHECK_CAMS={env}: socket(s) {bad} not in "
-                         f"the rig (has {sorted(rig)})")
+    field restores DP180-like distances. None when the reference itself
+    wins - the historical reference-framed design, bit for bit.
+
+    socks: the tracked sockets (from tracked_sockets); None reads
+    VIO_CHECK_CAMS itself and returns None when it is unset, the
+    historical behaviour. plan_framing decides WHETHER a derived set
+    may re-frame at all; this picks WHICH socket."""
+    if socks is None:
+        env = os.environ.get("VIO_CHECK_CAMS")
+        if not env:
+            return None
+        socks = [int(t) for t in env.replace(",", " ").split()]
+        bad = [s for s in socks if s not in rig]
+        if bad:
+            raise ValueError(f"VIO_CHECK_CAMS={env}: socket(s) {bad} not in "
+                             f"the rig (has {sorted(rig)})")
 
     def off_axis(s):
         z = rig[s]["T_camd_cam"][:3, :3] @ np.array([0.0, 0.0, 1.0])
         return math.acos(min(1.0, max(-1.0, float(z[2]))))
     best = min(socks, key=off_axis)
     return None if best == ref_sock else best
+
+
+def plan_framing(rig, ref_sock, cloud, center, normal):
+    """Framing socket + PathGeometry for this rig and scene, in one step.
+
+    Declared tracked sockets (VIO_CHECK_CAMS) keep the historical rule:
+    the declared socket closest to the reference axis frames the path
+    (select_framing). A derived set is conservative: the reference
+    keeps the framing unless its own design leaves the fit cone
+    (d_far > FIT_CONE_MAX x d_fit - a narrow reference like the NV180
+    camd backs the rig out of the scene), and only then does the
+    tracked camera closest to the reference axis take over. The
+    DP180's wide reference therefore keeps its historical design bit
+    for bit with no knob set, while the NV180 defaults to the framed
+    in-room design the knob used to require."""
+    socks, declared = tracked_sockets(rig, ref_sock)
+    if declared:
+        frame_sock = select_framing(rig, ref_sock, socks)
+    else:
+        try:
+            geom = PathGeometry(cloud, center, normal, rig[ref_sock])
+            if geom.d_far <= FIT_CONE_MAX * geom.d_fit:
+                return None, geom
+        except ValueError:
+            pass   # reference design impossible: hand over the framing
+        frame_sock = select_framing(rig, ref_sock,
+                                    [s for s in socks if s != ref_sock]
+                                    or socks)
+    geom = PathGeometry(cloud, center, normal, rig[ref_sock],
+                        frame_cam=(None if frame_sock is None
+                                   else rig[frame_sock]),
+                        frame_sock=frame_sock)
+    return frame_sock, geom
 
 
 def usable_half_angle(cam, axis, pad_px=EDGE_PAD_PX):
@@ -585,21 +667,18 @@ def run_checks(cfg, geom, rig, ref_sock, times, eyes, R_wc, check_cams=None):
     dt = 1.0 / cfg.fps
     pts_w = geom.cloud
     track_cams = list(rig)
-    declared = False
+    scoped = False
     if check_cams is None:
-        env_cams = os.environ.get("VIO_CHECK_CAMS")
-        if env_cams:
-            check_cams = [int(t) for t in env_cams.replace(",", " ").split()]
-            bad = [s for s in check_cams if s not in rig]
-            if bad:
-                raise ValueError(
-                    f"VIO_CHECK_CAMS={env_cams}: socket(s) {bad} not in "
-                    f"the rig (has {sorted(rig)})")
-            track_cams = check_cams
-            declared = True
-        else:
-            check_cams = [s for s, c in rig.items()
-                          if c["model"] == "kb4" and s != 0]
+        # tracked sockets: VIO_CHECK_CAMS, else derived from the rig.
+        # The reference needs no coverage rows of its own (the strict
+        # containment check already pins it), so a derived check set
+        # drops it - on the DP180 that reproduces the historical
+        # [camc, camb] rows exactly. An explicitly passed check_cams
+        # keeps the historical whole-rig scoping below.
+        track_cams, declared = tracked_sockets(rig, ref_sock)
+        scoped = True
+        check_cams = (track_cams if declared
+                      else [s for s in track_cams if s != ref_sock])
     frame_sock = getattr(geom, "frame_sock", None)
     if frame_sock is None:
         frame_sock = ref_sock
@@ -619,11 +698,12 @@ def run_checks(cfg, geom, rig, ref_sock, times, eyes, R_wc, check_cams=None):
     # only gains a PASS row.
     checks.append((
         "bands within the fit cone",
-        bool(geom.d_far <= 5.0 * geom.d_fit),
+        bool(geom.d_far <= FIT_CONE_MAX * geom.d_fit),
         f"far band {geom.d_far:.2f} m is "
         f"{geom.d_far / geom.d_fit:.1f}x the board-fit distance "
-        f"{geom.d_fit:.2f} m (max 5.0x) - the design backed out of "
-        f"the scene; frame the boards in a wide tracked camera",
+        f"{geom.d_fit:.2f} m (max {FIT_CONE_MAX:.1f}x) - the design "
+        f"backed out of the scene; frame the boards in a wide tracked "
+        f"camera",
         True))
 
     # per-camera projections over the whole path
@@ -681,8 +761,8 @@ def run_checks(cfg, geom, rig, ref_sock, times, eyes, R_wc, check_cams=None):
                     step = np.linalg.norm(px[both] - prev_px[both], axis=1).max()
                     max_step = max(max_step, float(step))
                     # the per-frame flow series follows the trackability
-                    # scope: only the declared tracked cameras feed it
-                    if not declared or s in track_cams:
+                    # scope: only the tracked cameras feed it
+                    if not scoped or s in track_cams:
                         steps_frame[i] = max(steps_frame[i], float(step))
             prev_px, prev_ok = px, inside
         cov[s] = dict(quad=quad, hist=hist, span_u=(umin, umax),
@@ -754,21 +834,21 @@ def run_checks(cfg, geom, rig, ref_sock, times, eyes, R_wc, check_cams=None):
     # trackability: focal x angular step + translation flow at the nearest
     # board point, per frame (the design formula), plus the measured corner
     # step from the projections above. Both must clear TRACKABLE_PX.
-    # The focal ranges over the cameras the tracker consumes: the whole
-    # rig by default, or the VIO_CHECK_CAMS sockets when declared (the
-    # NV180's untracked camd, fx 4263, would otherwise bound a camera VIO
-    # never sees).
+    # The focal ranges over the cameras the tracker consumes - the
+    # tracked sockets, derived or declared (the NV180's untracked camd,
+    # fx 4263, would otherwise bound a camera VIO never sees); an
+    # explicit check_cams argument keeps the historical whole rig.
     f_max = max(cams[s]["params"]["fx"] for s in track_cams)
-    measured_cams = track_cams if declared else list(cov)
+    measured_cams = track_cams if scoped else list(cov)
     d_min = np.array([np.linalg.norm(pts_w - eyes[i], axis=1).min()
                       for i in range(n)])
     dth = np.linalg.norm(wvec, axis=1) * dt
     dp = np.linalg.norm(np.diff(eyes, axis=0), axis=1)
     px_bound = f_max * dth + f_max * dp / d_min[:-1]
     peak["px_formula"] = float(px_bound.max())
-    # measured flow, like the formula, is a trackability statement: when
-    # the tracked cameras are declared it ranges over them (the untracked
-    # NV180 camd, fx 4263, carries fast flow VIO never sees)
+    # measured flow, like the formula, is a trackability statement: it
+    # ranges over the tracked cameras (the untracked NV180 camd,
+    # fx 4263, carries fast flow VIO never sees)
     peak["px_measured"] = max(cov[s]["max_step_px"] for s in measured_cams)
     checks.append(("px formula <= ceiling",
                    peak["px_formula"] <= cfg.trackable_px,
@@ -810,9 +890,10 @@ def verify_path(cfg, geom, rig, ref_sock, times, eyes, R_wc, check_cams=None):
     Returns a metrics dict and prints the summary table. check_cams:
     sockets that must cover every geometrically reachable image quadrant
     (see _reachable_quadrants) and both distance bands. Default: the
-    VIO_CHECK_CAMS env sockets, else every KB4 camera except socket 0
-    (camA points away from the boards on the DP180 and is not consumed
-    by the driver).
+    VIO_CHECK_CAMS env sockets, else the rig-derived tracked sockets
+    minus the reference (tracked_sockets; on the DP180 that is camb and
+    camc, the historical set - camA points away from the boards and is
+    not consumed by the driver, camD is the reference).
     """
     metrics, checks = run_checks(cfg, geom, rig, ref_sock, times, eyes,
                                  R_wc, check_cams)
@@ -913,11 +994,7 @@ def build_vio_trajectory(gui, name_hint="Quad", flip=False):
     nvr = gui.novel_view_renderer
     calib_path = nvr.calibration_fullpath
     rig, ref_sock = load_rig(calib_path)
-    frame_sock = select_framing(rig, ref_sock)
-    geom = PathGeometry(cloud, center, normal, rig[ref_sock],
-                        frame_cam=(None if frame_sock is None
-                                   else rig[frame_sock]),
-                        frame_sock=frame_sock)
+    frame_sock, geom = plan_framing(rig, ref_sock, cloud, center, normal)
     print(f"[vio] target {label}, calib {calib_path}")
     if frame_sock is not None:
         print(f"[vio] framing cam{'abcd'[frame_sock]} (tracked): distance "
@@ -1303,13 +1380,9 @@ def main(argv=None):
         print(f"[vio] alignment {cfg.alignment_path}: --cloud converted "
               f"from scene units at {align.scale:.4f} m/unit")
     rig, ref_sock = load_rig(args.calib)
-    frame_sock = select_framing(rig, ref_sock)
     center = 0.5 * (cloud.min(0) + cloud.max(0))
-    geom = PathGeometry(cloud, center, np.array([0.0, 0.0, 1.0]),
-                        rig[ref_sock],
-                        frame_cam=(None if frame_sock is None
-                                   else rig[frame_sock]),
-                        frame_sock=frame_sock)
+    frame_sock, geom = plan_framing(rig, ref_sock, cloud, center,
+                                    np.array([0.0, 0.0, 1.0]))
 
     seed = None
     if args.waypoints:
