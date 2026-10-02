@@ -151,6 +151,7 @@ def run_scene(tag, cloud, center, normal, rig, ref):
 
 
 NV_CALIB = os.path.join(REPO, "calibration_files", "NV180V2-80.121.0230.json")
+NV_CALIB_B = os.path.join(REPO, "calibration_files", "NV180V2-80.120.0101.json")
 
 
 def run_nv180():
@@ -311,6 +312,26 @@ def run_nv180():
     assert failed_nv == [], failed_nv
     print("PASS  nv180: derived default framed in camc, bit-identical "
           "to the declared 1,2 path, all strict checks pass")
+
+    # 10. the second converted unit: the same derived design from its
+    # own calibration (units share the design, never the values - the
+    # camc-camd tilt alone differs by 0.117 deg, ~9 px far away in camd)
+    rig_b, ref_b = vt.load_rig(NV_CALIB_B)
+    assert ref_b == 3
+    assert {s: c["model"] for s, c in rig_b.items()} == \
+        {1: "ds", 2: "kb4", 3: "kb4"}
+    socks_b, declared_b = vt.tracked_sockets(rig_b, ref_b)
+    assert not declared_b and sorted(socks_b) == [1, 2], socks_b
+    fs_b, geom_b = vt.plan_framing(rig_b, ref_b, cloud, center, up)
+    assert fs_b == 2, f"unit B framing {fs_b}: camc must take over"
+    assert geom_b.d_far <= vt.FIT_CONE_MAX * geom_b.d_fit
+    th_b = vt._kb4_fold_theta(rig_b[3]["params"])
+    assert 0.69 < th_b < 0.72, \
+        f"unit B camd fold {th_b:.3f} rad (native cap 40.3 deg)"
+    print(f"PASS  nv180: unit 80.120.0101 - same derived design (pair "
+          f"{{1,2}}, framed camc, bands {geom_b.d_near:.2f}.."
+          f"{geom_b.d_far:.2f} m) from its own calibration (camd fold "
+          f"{math.degrees(th_b):.1f} deg)")
 
 
 def main():
