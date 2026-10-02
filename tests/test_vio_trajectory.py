@@ -78,6 +78,19 @@ def run_scene(tag, cloud, center, normal, rig, ref):
           f"trackable px {metrics['peak']['px_formula']:.1f}/"
           f"{metrics['peak']['px_measured']:.1f} <= {cfg.trackable_px:.0f})")
 
+    # the scene-plausibility checks are armed for every rig: on the
+    # DP180 scenes they must be present and PASS (the design never
+    # leaves the fit cone, the speed stays handheld)
+    _, checks = vt.run_checks(cfg, geom, rig, ref, times, eyes, R_wc)
+    by = {name: ok for name, ok, _msg, _strict in checks}
+    assert by["bands within the fit cone"], \
+        f"fit-cone row missing or failing ({geom.d_far / geom.d_fit:.1f}x)"
+    assert by["peak speed plausible"], \
+        f"speed row missing or failing ({metrics['peak']['v']:.2f} m/s)"
+    print(f"PASS  {tag}: scene-plausibility rows PASS (bands "
+          f"{geom.d_far / geom.d_fit:.1f}x fit, peak "
+          f"{metrics['peak']['v']:.2f} m/s)")
+
     # 2. stationary lead truly stationary
     lead_n = int(math.floor(cfg.lead_s * cfg.fps)) + 1
     assert np.array_equal(eyes[:lead_n], np.repeat(eyes[:1], lead_n, 0)), \
@@ -190,9 +203,16 @@ def run_nv180():
     assert by["quadrant coverage camd"]
     assert not by["px formula <= ceiling"], \
         "whole-rig focal (camd fx 4263) must still bound the default"
+    # armed for every rig: the reference-framed far design must fail the
+    # scene-plausibility rows even without VIO_CHECK_CAMS
+    assert not by["bands within the fit cone"], \
+        f"{geom.d_far / geom.d_fit:.1f}x fit must fail the cone check"
+    assert not by["peak speed plausible"], \
+        f"{metrics['peak']['v']:.2f} m/s must fail the speed ceiling"
     print(f"PASS  nv180: default checks - camc passes on quadrants "
           f"{q.tolist()}, px formula honestly fails at "
-          f"{metrics['peak']['px_formula']:.1f} px")
+          f"{metrics['peak']['px_formula']:.1f} px, and the far design "
+          f"fails both scene-plausibility rows")
 
     os.environ["VIO_CHECK_CAMS"] = "1,2"
     try:

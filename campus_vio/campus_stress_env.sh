@@ -24,6 +24,10 @@ export STATIONARY_LEAD_S=3
 export VIO_MOTION_S=41.7
 export VIO_FPS=45
 export VIO_TRAJ_NPZ=mcap_outputs/campus_stress_truth.npz
+# The circuit's speed is the profile (measured peak 3.93 m/s): declare
+# it, so the peak-speed plausibility check gates regressions instead
+# of flagging the design.
+export VIO_MAX_SPEED=4.5
 export VIO_WAYPOINTS=campus_vio/campus_stress_waypoints.csv
 
 # Headless dry-run (CPU only; 6 board-visibility FAILs expected, no boards

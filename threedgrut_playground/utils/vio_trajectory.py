@@ -50,14 +50,16 @@ keep working; ARM_REACH is ignored here because clamping breaks C2):
                        analytic path frames the boards in the tracked
                        camera closest to the reference axis
                        (select_framing - a narrow reference no longer
-                       pushes the bands out of the room), and two
-                       scene-plausibility checks arm: the far band must
-                       stay within 5x the board-fit distance, and the
-                       peak speed under VIO_MAX_SPEED. Unset: the
+                       pushes the bands out of the room). Unset: the
                        historical behaviour, byte for byte.
-  VIO_MAX_SPEED        peak-speed ceiling [m/s] for the plausibility
-                       check above, default 3.0. Checked only when
-                       VIO_CHECK_CAMS is set.
+  VIO_MAX_SPEED        peak-speed ceiling [m/s] for the scene-
+                       plausibility check, default 3.0. Checked on
+                       every run, every rig: a design whose bands left
+                       the scene always fails loudly (the fit-cone
+                       check is its distance-side twin). Waypoint
+                       profiles that encode faster motion on purpose
+                       declare their own ceiling (campus_vio env
+                       files).
   VIO_TRAJ_NPZ         ground-truth output, default mcap_outputs/vio_truth.npz
   VIO_WAYPOINTS        waypoint file (same formats as --waypoints below).
                        build_vio_trajectory then renders the C2 spline
@@ -261,9 +263,9 @@ class VioConfig:
             self.motion_s = T_DIST
         self.fps = float(env("VIO_FPS", 20.0))
         self.trackable_px = float(env("TRACKABLE_PX", 50.0))
-        # Scene-plausibility speed ceiling, checked only when
-        # VIO_CHECK_CAMS declares the tracked cameras (the historical
-        # default runs stay byte-identical).
+        # Scene-plausibility speed ceiling (VIO_MAX_SPEED), checked on
+        # every run. Deliberately fast waypoint profiles declare their
+        # own ceiling in their env files.
         self.max_speed = float(env("VIO_MAX_SPEED", 3.0))
         # STRESS multiplies the post-ramp phase clock (see pose_at): x1.0
         # is exact (a float times 1.0 is itself), so the default path is
@@ -610,20 +612,19 @@ def run_checks(cfg, geom, rig, ref_sock, times, eyes, R_wc, check_cams=None):
                    bool(near_f.any() and far_f.any()),
                    "distance bands not both visited", True))
 
-    # Scene plausibility (only when the tracked cameras are declared, so
-    # the historical default output stays byte-identical): the bands must
-    # stay near the board-fit distance - a design that backs off far
+    # Scene plausibility, distance side (every run, every rig): the bands
+    # must stay near the board-fit distance - a design that backs off far
     # beyond it (a narrow camera framing the boards) has left the scene
-    # the boards stand in.
-    if declared:
-        checks.append((
-            "bands within the fit cone",
-            bool(geom.d_far <= 5.0 * geom.d_fit),
-            f"far band {geom.d_far:.2f} m is "
-            f"{geom.d_far / geom.d_fit:.1f}x the board-fit distance "
-            f"{geom.d_fit:.2f} m (max 5.0x) - the design backed out of "
-            f"the scene; frame the boards in a wide tracked camera",
-            True))
+    # the boards stand in. The DP180 default sits at 2.4x, so its table
+    # only gains a PASS row.
+    checks.append((
+        "bands within the fit cone",
+        bool(geom.d_far <= 5.0 * geom.d_fit),
+        f"far band {geom.d_far:.2f} m is "
+        f"{geom.d_far / geom.d_fit:.1f}x the board-fit distance "
+        f"{geom.d_fit:.2f} m (max 5.0x) - the design backed out of "
+        f"the scene; frame the boards in a wide tracked camera",
+        True))
 
     # per-camera projections over the whole path
     cams = {s: rig[s] for s in set(list(rig)) }
@@ -738,17 +739,17 @@ def run_checks(cfg, geom, rig, ref_sock, times, eyes, R_wc, check_cams=None):
         w=float(np.linalg.norm(wvec, axis=1).max()),
         alpha=float(np.linalg.norm(alpha, axis=1).max()))
 
-    # Scene plausibility, speed side (tracked-cams runs only): the rig is
+    # Scene plausibility, speed side (every run, every rig): the rig is
     # carried through a room, so its speed must stay in a handheld/robot
-    # range whatever distances the design chose.
-    if declared:
-        checks.append((
-            "peak speed plausible",
-            bool(peak["v"] <= cfg.max_speed),
-            f"peak speed {peak['v']:.2f} m/s exceeds VIO_MAX_SPEED "
-            f"{cfg.max_speed:g} m/s - implausible for a scene-bound rig; "
-            f"the distance bands have left the scene's scale",
-            True))
+    # range whatever distances the design chose. Waypoint profiles that
+    # encode faster motion on purpose raise VIO_MAX_SPEED in their env.
+    checks.append((
+        "peak speed plausible",
+        bool(peak["v"] <= cfg.max_speed),
+        f"peak speed {peak['v']:.2f} m/s exceeds VIO_MAX_SPEED "
+        f"{cfg.max_speed:g} m/s - implausible for a scene-bound rig; "
+        f"the distance bands have left the scene's scale",
+        True))
 
     # trackability: focal x angular step + translation flow at the nearest
     # board point, per frame (the design formula), plus the measured corner
